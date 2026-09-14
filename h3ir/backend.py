@@ -173,11 +173,21 @@ def user_message(text: str, images: list[str | Path] | None = None) -> dict[str,
 
 
 class Backend:
-    def __init__(self, cfg=None, client: httpx.Client | None = None):
+    def __init__(self, cfg=None, client: httpx.Client | None = None, num_ctx: int = 0):
         self.cfg = (cfg or get_config()).llm
         self._client = client
         self._owns_client = client is None
         self._resolved_model: str | None = None
+        # Per-request only, never read from the environment: the caller who knows a brief's
+        # reference pictures push it past the endpoint's default context states it here, once,
+        # for every chat call this Backend instance makes. 0 means "say nothing" -- the server's
+        # own default stands, which is what every existing caller already gets. Ollama's default
+        # is 4096; measured, an ~8k-token brief with pictures comes back empty without a larger
+        # one and truncated with `finish_reason=length` rather than an error. Only Ollama's
+        # `/v1/chat/completions` is confirmed to honour this top-level `options` field; a server
+        # that does not recognise it may ignore or reject it, so set it only when talking to one
+        # that does.
+        self.num_ctx = num_ctx
 
     def model_id(self) -> str:
         """The model id to send. Set by config, or discovered by `require_available`."""
@@ -390,6 +400,11 @@ class Backend:
             body["seed"] = seed
         if stop:
             body["stop"] = stop
+        if self.num_ctx > 0:
+            # The only spelling Ollama honours for this. Omitted entirely rather than sent as 0
+            # or null: a caller that never asked for a larger window gets exactly the request
+            # every existing caller already sends.
+            body["options"] = {"num_ctx": self.num_ctx}
         if response_format is not None:
             body["response_format"] = response_format
         if not thinking:

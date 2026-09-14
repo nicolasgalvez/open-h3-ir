@@ -214,9 +214,17 @@ to read a format it does not care about: `presentation` is plain language for sh
 is the creative decisions somebody wants to change, and `ir` is the document plus the manifest for
 whoever wires the render. `GET /v1/capabilities` reports the legal durations, aspects and asset limits,
 so a caller never hardcodes them. `GET /v1/contract` reports every field name, every role and every
-refusal code this build takes. It carries a version number of its own, 2 in this release. A client
+refusal code this build takes. It carries a version number of its own, 3 in this release. A client
 reads it and checks itself against the service before it sends anything. A field this
 service does not know is refused by name, never dropped.
+
+Set `"llm": {"num_ctx": 32768}` on a brief to raise the reasoning model's context window for that
+request only. There is no environment variable for it, because the machine the compiler runs on
+does not know how big any particular brief is going to be — the caller attaching six reference
+pictures does. It is sent as `{"options": {"num_ctx": n}}` on every call that brief makes and
+omitted entirely when left unset. Ollama's own default context is 4096 tokens, and a brief with
+pictures routinely needs more than that; an endpoint that does not recognise the field ignores or
+rejects it, so set it only when talking to one that honours it.
 
 Attachments arrive two ways. A caller that shares a filesystem with the service names a path, and
 nothing is copied. A caller on another machine sends the bytes to `PUT /v1/assets/{sha256}` and then
