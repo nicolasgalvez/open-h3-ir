@@ -172,12 +172,58 @@ def user_message(text: str, images: list[str | Path] | None = None) -> dict[str,
     return {"role": "user", "content": parts}
 
 
+def _reply_from_completion(data: dict[str, Any], wall: float, budget: int) -> Reply:
+    """The OpenAI-shaped answer, parsed once for every path that produces one.
+
+    The wire path (`_once`) and the in-process engine path (`_engine_chat`) receive the same
+    document, and F15/F16 below are true of either: a model that spent its budget on reasoning,
+    a reply truncated at the cap, and a reasoning parser leaking in-progress thinking into
+    `content` are failures of the model, not of the transport.
+    """
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = msg.get("content")
+    reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+    usage = data.get("usage") or {}
+    finish = choice.get("finish_reason") or "?"
+
+    if content is None or not str(content).strip():
+        why = ("the reasoning budget was consumed before any answer was emitted" if reasoning
+               else "no reasoning came back either, so the budget is not the explanation and "
+                    "this model stopped without answering")
+        raise TruncatedResponse(
+            f"model returned no content (finish_reason={finish}, "
+            f"completion_tokens={usage.get('completion_tokens')}, "
+            f"reasoning_chars={len(reasoning)}): {why}")
+    if finish == "length":
+        raise TruncatedResponse(
+            f"response hit max_tokens ({budget}); output is incomplete")
+
+    text = str(content)
+    if "<think>" in text and "</think>" not in text:
+        raise TruncatedResponse(
+            "content carries an unclosed <think> — this is leaked in-progress reasoning, "
+            "not an answer (vLLM #35221)")
+
+    return Reply(content=str(content).strip(), reasoning=reasoning,
+                 prompt_tokens=usage.get("prompt_tokens", 0),
+                 completion_tokens=usage.get("completion_tokens", 0),
+                 finish_reason=finish, wall_s=wall, model=data.get("model", ""))
+
+
 class Backend:
-    def __init__(self, cfg=None, client: httpx.Client | None = None, num_ctx: int = 0):
+    def __init__(self, cfg=None, client: httpx.Client | None = None, num_ctx: int = 0,
+                 engine: Any = None):
         self.cfg = (cfg or get_config()).llm
         self._client = client
         self._owns_client = client is None
         self._resolved_model: str | None = None
+        # A model handed over already loaded, from inside the same Python. A ComfyUI loader node
+        # owns the file, the context and the GPU layers; this compiler owns the words. The engine
+        # is duck-typed on purpose -- `create_chat_completion(**kwargs)` and nothing else -- so
+        # this package imports nothing and depends on nothing to speak it, and the loader's pack
+        # stays the single place llama-cpp-python is configured.
+        self._engine = engine
         # Dialect detection for the thinking-off spelling; None means "not asked yet". See
         # `_is_ollama_endpoint`.
         self._ollama_dialect: bool | None = None
@@ -194,6 +240,10 @@ class Backend:
 
     def model_id(self) -> str:
         """The model id to send. Set by config, or discovered by `require_available`."""
+        if self._engine is not None:
+            named = getattr(self._engine, "model_path", "") or ""
+            import os
+            return self.cfg.model or os.path.basename(named)
         return self.cfg.model or self._resolved_model or ""
 
     def _discover_model(self) -> None:
@@ -307,6 +357,8 @@ class Backend:
         the request then goes out exactly as it did before this existed, which on a non-Ollama
         endpoint is already the correct request.
         """
+        if self._engine is not None:
+            return False          # no wire, no dialect: an injected engine speaks in-process
         if self._ollama_dialect is None:
             try:
                 self._ollama_dialect = self._get(
@@ -346,6 +398,12 @@ class Backend:
 
     def health_probe(self) -> HealthProbe:
         """Which liveness path answered, and what each one said. See `liveness_urls`."""
+        if self._engine is not None:
+            # There is no server to ask. The engine was handed over loaded, by a node that owns
+            # its lifecycle; "up" here means exactly "still handed over", and the via names the
+            # model file so a report says which in-process model wrote the brief.
+            named = getattr(self._engine, "model_path", "") or "in-process model"
+            return HealthProbe(True, named, (("engine", named),))
         attempts: list[tuple[str, str]] = []
         for url in self.liveness_urls():
             try:
@@ -375,6 +433,8 @@ class Backend:
         Ollama answers `/api/version`, and both return `{"version": ...}`. Provenance that reads
         `?` on every run is provenance nobody can use.
         """
+        if self._engine is not None:
+            return f"in-process ({type(self._engine).__module__.split('.')[0]})"
         for url in (f"{self._root_url()}/version", f"{self._root_url()}/api/version"):
             try:
                 v = self._get(url, 5.0).json().get("version")
@@ -393,6 +453,8 @@ class Backend:
                 "Start it, or set H3IR_LLM_URL. Refusing to produce a lower-quality IR silently. "
                 f"Tried: {tried}")
         if not self.cfg.model and self._resolved_model is None:
+            if self._engine is not None:
+                return          # the model was handed over; there is no list to discover from
             self._discover_model()
 
     # ------------------------------------------------------------------ calls
@@ -409,6 +471,52 @@ class Backend:
             raise BackendError(
                 "structured output requires thinking=False on this endpoint "
                 "(json_schema is silently not applied while reasoning is enabled)")
+
+        if self._engine is not None:
+            # In-process: the model was handed over loaded. The ladder below (grow the budget on
+            # truncation, back off on a failure) is the wire loop's, because F15 is a property of
+            # the model and not of the transport; the kwargs differ only in never carrying a
+            # thinking dialect, which is a wire problem and there is no wire.
+            kwargs: dict[str, Any] = {"messages": messages,
+                                      "max_tokens": max_tokens or self.cfg.max_tokens,
+                                      "temperature": temperature}
+            if seed is not None:
+                kwargs["seed"] = seed
+            if stop:
+                kwargs["stop"] = stop
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            last: Exception | None = None
+            for attempt in range(retries + 1):
+                try:
+                    t0 = time.time()
+                    data = self._engine.create_chat_completion(**kwargs)
+                    return _reply_from_completion(
+                        data, time.time() - t0, kwargs["max_tokens"])
+                except TruncatedResponse as e:
+                    last = e
+                    if attempt < retries:
+                        grown = int(kwargs["max_tokens"] * 1.75)
+                        ceiling = max(self.cfg.max_tokens, 2 * MAX_GROWTH_BASE)
+                        if grown > ceiling:
+                            log.warning("truncated at %s tokens and the ceiling is %s; not "
+                                        "growing further", kwargs["max_tokens"], ceiling)
+                            break
+                        kwargs["max_tokens"] = grown
+                        log.warning("truncated; retrying with max_tokens=%s", grown)
+                        continue
+                    break
+                except Exception as e:  # noqa: BLE001 - engine failure, retried like a wire one
+                    last = e
+                    if attempt < retries:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    break
+            # Re-raised as-is, the way the wire loop does: a caller keys on the TYPE (the fix
+            # loop grows a budget on TruncatedResponse, and wrapping it would hide that).
+            if last is not None:
+                raise last
+            raise BackendError("the in-process model was asked nothing; this is a bug")
 
         body: dict[str, Any] = {
             "model": self.model_id(),
@@ -478,46 +586,7 @@ class Backend:
         if r.status_code >= 400:
             raise EndpointRefused(r.status_code, r.text)
         data = r.json()
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        content = msg.get("content")
-        reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
-        usage = data.get("usage") or {}
-        finish = choice.get("finish_reason") or "?"
-
-        # F15: reasoning ate the budget. Loud, not empty-string.
-        #
-        # The cause is only named when the reply carries the evidence for it. This message used to
-        # assert the reasoning budget every time, and a small non-reasoning model that simply
-        # stopped produced "the reasoning budget was consumed" beside "reasoning_chars=0" in the
-        # same sentence: a diagnosis its own numbers contradict, sending the reader to raise a
-        # budget that was never the problem.
-        if content is None or not str(content).strip():
-            why = ("the reasoning budget was consumed before any answer was emitted" if reasoning
-                   else "no reasoning came back either, so the budget is not the explanation and "
-                        "this model stopped without answering")
-            raise TruncatedResponse(
-                f"model returned no content (finish_reason={finish}, "
-                f"completion_tokens={usage.get('completion_tokens')}, "
-                f"reasoning_chars={len(reasoning)}): {why}")
-        if finish == "length":
-            raise TruncatedResponse(
-                f"response hit max_tokens ({body['max_tokens']}); output is incomplete")
-
-        # vLLM #35221: when generation truncates before `</think>`, the Qwen3 reasoning parser
-        # cannot tell "thinking off" from "thinking unfinished" and puts raw in-progress
-        # reasoning into `content`. An unclosed marker means this reply is reasoning, not an
-        # answer, so trust the marker rather than the field split.
-        text = str(content)
-        if "<think>" in text and "</think>" not in text:
-            raise TruncatedResponse(
-                "content carries an unclosed <think> — this is leaked in-progress reasoning, "
-                "not an answer (vLLM #35221)")
-
-        return Reply(content=str(content).strip(), reasoning=reasoning,
-                     prompt_tokens=usage.get("prompt_tokens", 0),
-                     completion_tokens=usage.get("completion_tokens", 0),
-                     finish_reason=finish, wall_s=wall, model=data.get("model", ""))
+        return _reply_from_completion(data, wall, body["max_tokens"])
 
     # ------------------------------------------------------------------ structured
 
