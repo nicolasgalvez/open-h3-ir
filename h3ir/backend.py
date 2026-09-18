@@ -173,11 +173,24 @@ def user_message(text: str, images: list[str | Path] | None = None) -> dict[str,
 
 
 class Backend:
-    def __init__(self, cfg=None, client: httpx.Client | None = None):
+    def __init__(self, cfg=None, client: httpx.Client | None = None, num_ctx: int = 0):
         self.cfg = (cfg or get_config()).llm
         self._client = client
         self._owns_client = client is None
         self._resolved_model: str | None = None
+        # Dialect detection for the thinking-off spelling; None means "not asked yet". See
+        # `_is_ollama_endpoint`.
+        self._ollama_dialect: bool | None = None
+        # Per-request only, never read from the environment: the caller who knows a brief's
+        # reference pictures push it past the endpoint's default context states it here, once,
+        # for every chat call this Backend instance makes. 0 means "say nothing" -- the server's
+        # own default stands, which is what every existing caller already gets. Ollama's default
+        # is 4096; measured, an ~8k-token brief with pictures comes back empty without a larger
+        # one and truncated with `finish_reason=length` rather than an error. Only Ollama's
+        # `/v1/chat/completions` is confirmed to honour this top-level `options` field; a server
+        # that does not recognise it may ignore or reject it, so set it only when talking to one
+        # that does.
+        self.num_ctx = num_ctx
 
     def model_id(self) -> str:
         """The model id to send. Set by config, or discovered by `require_available`."""
@@ -285,6 +298,23 @@ class Backend:
         base = self.base_url()
         return base[: -len("/v1")] if base.endswith("/v1") else base
 
+    def _is_ollama_endpoint(self) -> bool:
+        """Whether the endpoint answered as Ollama, probed once per Backend and cached.
+
+        `GET /api/version` is a path only Ollama registers (see `liveness_urls`), so a 200 from it
+        settles the question without trusting the URL's shape. Used for one thing only: picking
+        the wire spelling that turns thinking off. A probe that cannot complete answers False --
+        the request then goes out exactly as it did before this existed, which on a non-Ollama
+        endpoint is already the correct request.
+        """
+        if self._ollama_dialect is None:
+            try:
+                self._ollama_dialect = self._get(
+                    f"{self._root_url()}/api/version", 5.0).status_code == 200
+            except Exception:  # noqa: BLE001 - dialect detection only; False keeps the old request
+                self._ollama_dialect = False
+        return self._ollama_dialect
+
     def liveness_urls(self) -> tuple[str, ...]:
         """The paths tried, in order, to decide whether an endpoint is up.
 
@@ -390,11 +420,26 @@ class Backend:
             body["seed"] = seed
         if stop:
             body["stop"] = stop
+        if self.num_ctx > 0:
+            # The only spelling Ollama honours for this. Omitted entirely rather than sent as 0
+            # or null: a caller that never asked for a larger window gets exactly the request
+            # every existing caller already sends.
+            body["options"] = {"num_ctx": self.num_ctx}
         if response_format is not None:
             body["response_format"] = response_format
         if not thinking:
             # The ONLY spelling that works. {"thinking": False} is silently ignored.
             body["chat_template_kwargs"] = {"enable_thinking": False}
+            if self._is_ollama_endpoint():
+                # MEASURED (2026-09, live Ollama 0.34.2): `chat_template_kwargs` is not a field of
+                # Ollama's OpenAI `ChatCompletionRequest` struct, so it is dropped silently and the
+                # Qwen3 template's own default -- thinking on -- runs anyway, charging ~13k
+                # reasoning tokens per call at ~48 tok/s. On `/v1` the one spelling this Ollama
+                # honours is OpenAI's own `reasoning_effort: "none"`. Sent only once the endpoint
+                # has answered `/api/version`, so vLLM (which honours the spelling above) and every
+                # hosted API keep the exact request they already received -- `reasoning_effort` is
+                # a live field for hosted reasoning models, and "none" is not one of their values.
+                body["reasoning_effort"] = "none"
 
         last: Exception | None = None
         for attempt in range(retries + 1):

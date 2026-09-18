@@ -47,6 +47,11 @@ def _canned(replies: list[str]) -> Backend:
     seq = list(replies)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        # Only the chat path is this fake's business. Anything else -- a dialect probe asking
+        # /api/version, say -- gets the 404 a real non-Ollama endpoint answers with, rather than
+        # silently consuming a reply from the sequence.
+        if not request.url.path.endswith("/chat/completions"):
+            return httpx.Response(404, json={"error": "not found"})
         body = seq.pop(0) if seq else ""
         return httpx.Response(200, json={
             "choices": [{"finish_reason": "stop", "message": {"content": body}}],

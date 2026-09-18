@@ -102,6 +102,25 @@ class DialogueIn(BaseModel):
     voiceover: bool = False
 
 
+class LLMIn(BaseModel):
+    """A per-request override of how this brief's own calls to the reasoning model are made.
+
+    Nothing here is an environment variable, on purpose: the caller who is about to attach six
+    reference pictures is the one who knows this brief needs more room than the last one, and a
+    setting on the machine the compiler happens to run on cannot know that.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    num_ctx: int | None = Field(
+        None, ge=0,
+        description="The reasoning model's context window in tokens, for this brief's calls "
+                    "only. Ollama serves 4096 unless told otherwise, and a brief with reference "
+                    "pictures is usually larger than that. Sent as "
+                    "{\"options\": {\"num_ctx\": n}} on every request this brief makes. Omitted "
+                    "or 0 sends nothing, which is the server's own default.")
+
+
 class BriefIn(BaseModel):
     """The minimum viable request is `intent`. Everything else has a good default.
 
@@ -168,10 +187,14 @@ class BriefIn(BaseModel):
     answer: dict[str, str] | None = Field(
         None, description="Optional answer to a previous clarification, e.g. "
                           '{"anchor_or_reference": "opening_frame"}')
+    llm: LLMIn | None = None
 
 
 class RefineIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     change: str
+    llm: LLMIn | None = None
 
 
 # --------------------------------------------------------------------------- conversion
@@ -637,12 +660,20 @@ async def _drain(request: Request, budget: int = 0) -> None:
         return
 
 
+def _backend_for(llm: LLMIn | None) -> Backend:
+    """The `Backend` this brief's own calls go through -- one per request, closed when the route
+    is done with it, so an override never outlives the request that asked for it. `num_ctx` is 0,
+    meaning "say nothing", unless the request set it: see `LLMIn`."""
+    return Backend(get_config(), num_ctx=(llm.num_ctx or 0) if llm else 0)
+
+
 @app.post("/v1/briefs")
 def create_brief(body: BriefIn) -> JSONResponse:
     brief = _to_brief(body)
     opts = ProfileOptions(name=get_config().profile)
+    backend = _backend_for(body.llm)
     try:
-        doc = compile_brief(brief, opts=opts, seed=body.seed,
+        doc = compile_brief(brief, backend=backend, opts=opts, seed=body.seed,
                             thinking_prose=(body.effort == "max"),
                             transcripts=dict(body.transcripts))
     except BriefRefused as e:
@@ -664,6 +695,8 @@ def create_brief(body: BriefIn) -> JSONResponse:
                                          "message": str(e)}) from e
     except AssetAnalysisError as e:
         raise HTTPException(422, detail={"code": "asset-unreadable", "message": str(e)}) from e
+    finally:
+        backend.close()
 
     brief_id = uuid.uuid4().hex[:16]
     _remember(brief_id, brief, doc)
@@ -700,8 +733,9 @@ def refine_brief(brief_id: str, body: RefineIn) -> JSONResponse:
             "code": "change-empty",
             "message": "`change` is empty, so there is nothing to apply. Say what to change in "
                        "plain language, for example 'make it 8 seconds' or 'lose the dialogue'."})
+    backend = _backend_for(body.llm)
     try:
-        doc, amended, changed = refine(rec["brief"], body.change,
+        doc, amended, changed = refine(rec["brief"], body.change, backend=backend,
                                        opts=ProfileOptions(name=get_config().profile))
     except BriefRefused as e:
         raise HTTPException(422, detail={"code": e.code, "message": str(e)}) from e
@@ -716,6 +750,8 @@ def refine_brief(brief_id: str, body: RefineIn) -> JSONResponse:
                                          "message": str(e)}) from e
     except AssetAnalysisError as e:
         raise HTTPException(422, detail={"code": "asset-unreadable", "message": str(e)}) from e
+    finally:
+        backend.close()
     _remember(brief_id, amended, doc)
     env = _envelope(brief_id, doc, amended)
     env["changed"] = changed
