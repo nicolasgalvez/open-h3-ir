@@ -414,6 +414,83 @@ def test_a_schema_call_with_thinking_on_omits_the_grammar():
     assert captured.get("chat_template_kwargs") is None, "thinking must stay on"
 
 
+# ------------------------------------------- turning thinking off, per server dialect
+
+def _dialect_endpoint(version_status: int, captured: dict, probes: list) -> httpx.Client:
+    """A fake OpenAI endpoint whose `/api/version` answers `version_status`, recording chat
+    bodies into `captured` and every probe into `probes`."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/version"):
+            probes.append(str(request.url))
+            return httpx.Response(version_status, json={"version": "0.34.2"})
+        captured.update(_json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"finish_reason": "stop", "message": {"content": "OK"}}],
+            "usage": {}})
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_an_ollama_endpoint_gets_the_reasoning_effort_spelling_too():
+    """MEASURED (2026-09, Ollama 0.34.2): `chat_template_kwargs` is not a field of Ollama's
+    OpenAI request struct, so it is dropped and the Qwen3 template's own default -- thinking on
+    -- runs anyway: ~13k reasoning tokens per call, minutes per compile. The one `/v1` spelling
+    that Ollama honours is `reasoning_effort: "none"`. Both spellings ride in one body: vLLM
+    reads the one it knows, Ollama reads the other."""
+    captured: dict = {}
+    probes: list = []
+    b = Backend(client=_dialect_endpoint(200, captured, probes))
+    b.chat([{"role": "user", "content": "Say OK."}], thinking=False, retries=0)
+    assert captured.get("chat_template_kwargs") == {"enable_thinking": False}
+    assert captured.get("reasoning_effort") == "none", \
+        "an Ollama endpoint was not told to stop thinking in the dialect it reads"
+    assert len(probes) == 1, "the dialect must be probed once per Backend, not per call"
+    b.chat([{"role": "user", "content": "Again."}], thinking=False, retries=0)
+    assert len(probes) == 1, "the second call re-probed a dialect already settled"
+
+
+def test_a_non_ollama_endpoint_gets_exactly_the_request_it_always_got():
+    """`reasoning_effort` is a live field for hosted reasoning models and "none" is not one of
+    their values, so it may only ever be sent to an endpoint that answered `/api/version`. A
+    vLLM or hosted endpoint that 404s the probe keeps the byte-equal request it received before
+    this existed."""
+    captured: dict = {}
+    b = Backend(client=_dialect_endpoint(404, captured, []))
+    b.chat([{"role": "user", "content": "Say OK."}], thinking=False, retries=0)
+    assert "reasoning_effort" not in captured, \
+        "reasoning_effort was sent to an endpoint that never said it was Ollama"
+    assert captured.get("chat_template_kwargs") == {"enable_thinking": False}
+
+
+def test_a_probe_that_cannot_complete_keeps_the_old_request():
+    """A gateway that blackholes `/api/version` is not Ollama's to answer for. The probe fails,
+    the dialect reads as not-Ollama, and the request goes out unchanged."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/version"):
+            raise httpx.ConnectError("blackholed")
+        import json as _json
+        captured.update(_json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"finish_reason": "stop", "message": {"content": "OK"}}],
+            "usage": {}})
+
+    b = Backend(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    b.chat([{"role": "user", "content": "Say OK."}], thinking=False, retries=0)
+    assert "reasoning_effort" not in captured
+
+
+def test_thinking_on_never_sends_either_spelling_on_any_dialect():
+    captured: dict = {}
+    b = Backend(client=_dialect_endpoint(200, captured, []))
+    b.chat([{"role": "user", "content": "Think about it."}], thinking=True, retries=0)
+    assert "reasoning_effort" not in captured
+    assert "chat_template_kwargs" not in captured
+
+
 # --------------------------------------------------------------- the manifest is the contract
 
 def test_a_text_only_brief_publishes_an_empty_manifest():
