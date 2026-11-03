@@ -80,6 +80,16 @@ class LLMConfig:
     # being emitted, looping until the token cap. We validate in Python either way, so the
     # grammar buys nothing we rely on and costs two known failure modes.
     guided_decoding: bool = field(default_factory=lambda: _env_bool("H3IR_GUIDED_DECODING", False))
+    # Which wire shape `Backend.chat` uses when a brief's `num_ctx` override is set (0 never
+    # matters here -- the OpenAI path is unchanged). "auto" (default) detects Ollama once per
+    # `Backend` by asking `{root}/api/version`, a path only Ollama answers. "ollama" forces the
+    # native `POST /api/chat`, the only wire shape that actually raises the loaded context --
+    # `/v1/chat/completions` unmarshals into a Go struct with no `options`/`num_ctx` field
+    # (openai/openai.go `ChatCompletionRequest`), so `encoding/json` drops it silently and the
+    # model keeps loading at its default. "openai" always uses `/v1/chat/completions`, for an
+    # endpoint that is not Ollama but does honour something under that name. See
+    # `Backend._wants_native_ollama`.
+    api_mode: str = field(default_factory=lambda: _env("H3IR_LLM_API", "auto"))
 
 
 @dataclass(frozen=True)

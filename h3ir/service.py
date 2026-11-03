@@ -116,9 +116,11 @@ class LLMIn(BaseModel):
         None, ge=0,
         description="The reasoning model's context window in tokens, for this brief's calls "
                     "only. Ollama serves 4096 unless told otherwise, and a brief with reference "
-                    "pictures is usually larger than that. Sent as "
-                    "{\"options\": {\"num_ctx\": n}} on every request this brief makes. Omitted "
-                    "or 0 sends nothing, which is the server's own default.")
+                    "pictures is usually larger than that. Sent as options.num_ctx on every "
+                    "request this brief makes, over Ollama's native /api/chat (not "
+                    "/v1/chat/completions, which silently ignores it) -- see H3IR_LLM_API and "
+                    "Backend._wants_native_ollama. Omitted or 0 sends nothing, which is the "
+                    "server's own default.")
 
 
 class BriefIn(BaseModel):

@@ -221,10 +221,12 @@ service does not know is refused by name, never dropped.
 Set `"llm": {"num_ctx": 32768}` on a brief to raise the reasoning model's context window for that
 request only. There is no environment variable for it, because the machine the compiler runs on
 does not know how big any particular brief is going to be — the caller attaching six reference
-pictures does. It is sent as `{"options": {"num_ctx": n}}` on every call that brief makes and
-omitted entirely when left unset. Ollama's own default context is 4096 tokens, and a brief with
-pictures routinely needs more than that; an endpoint that does not recognise the field ignores or
-rejects it, so set it only when talking to one that honours it.
+pictures does. Ollama's own default context is 4096 tokens, and a brief with pictures routinely
+needs more than that. Ollama's OpenAI-compatible `/v1/chat/completions` silently drops
+`options.num_ctx`, so when `num_ctx` is set and the endpoint answers `/api/version` (Ollama), the
+calls go over Ollama's native `/api/chat` with `options.num_ctx`. `H3IR_LLM_API` picks the shape
+explicitly: `auto` (default), `ollama`, or `openai` (always `/v1/chat/completions`, for other
+servers). Left unset, nothing changes and every call uses `/v1/chat/completions` as before.
 
 Attachments arrive two ways. A caller that shares a filesystem with the service names a path, and
 nothing is copied. A caller on another machine sends the bytes to `PUT /v1/assets/{sha256}` and then
