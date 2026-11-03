@@ -211,6 +211,42 @@ def _reply_from_completion(data: dict[str, Any], wall: float, budget: int) -> Re
                  finish_reason=finish, wall_s=wall, model=data.get("model", ""))
 
 
+def _b64_from_data_url(url: str) -> str:
+    """The base64 payload of a `data:...;base64,...` URL, or the string unchanged if it is
+    already bare base64. Native `/api/chat` wants raw base64 in `message.images`, not a data
+    URL -- unlike the OpenAI path's `image_url.url`, which wants the whole thing."""
+    _, _, payload = url.partition(",")
+    return payload if payload else url
+
+
+def _to_native_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The `user_message()` OpenAI shape (`content` a string, or a list of text/`image_url`
+    parts), translated to native `/api/chat` messages: a plain string `content` plus a sibling
+    `images: [base64, ...]` list (`api.Message` in Ollama's own types.go), rather than images
+    interleaved as content parts."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            texts: list[str] = []
+            images: list[str] = []
+            for part in content:
+                ptype = part.get("type")
+                if ptype == "text":
+                    texts.append(part.get("text", ""))
+                elif ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url:
+                        images.append(_b64_from_data_url(url))
+            nm: dict[str, Any] = {"role": m["role"], "content": "\n".join(texts)}
+            if images:
+                nm["images"] = images
+        else:
+            nm = {"role": m["role"], "content": content}
+        out.append(nm)
+    return out
+
+
 class Backend:
     def __init__(self, cfg=None, client: httpx.Client | None = None, num_ctx: int = 0,
                  engine: Any = None):
@@ -232,10 +268,18 @@ class Backend:
         # for every chat call this Backend instance makes. 0 means "say nothing" -- the server's
         # own default stands, which is what every existing caller already gets. Ollama's default
         # is 4096; measured, an ~8k-token brief with pictures comes back empty without a larger
-        # one and truncated with `finish_reason=length` rather than an error. Only Ollama's
-        # `/v1/chat/completions` is confirmed to honour this top-level `options` field; a server
-        # that does not recognise it may ignore or reject it, so set it only when talking to one
-        # that does.
+        # one and truncated with `finish_reason=length` rather than an error.
+        #
+        # MEASURED (2026-09, live Ollama 0.33.3): `{"options": {"num_ctx": n}}` on
+        # `/v1/chat/completions` has NO EFFECT -- `GET /api/ps` keeps reporting the model's
+        # `context_length` at 4096 after the call. Ollama's OpenAI-compat handler unmarshals the
+        # body into `ChatCompletionRequest` (openai/openai.go), a Go struct with no `options` or
+        # `num_ctx` field; `encoding/json` drops unknown keys silently, so the value never reaches
+        # `api.ChatRequest.Options`. Only the NATIVE `POST /api/chat` honours `options.num_ctx` --
+        # it unmarshals straight into `ChatRequest`, whose `Options` is `map[string]any` -- and
+        # the same value there measurably raises the loaded context. `chat()` therefore routes
+        # through `/api/chat` whenever `num_ctx > 0` and the endpoint looks like Ollama; see
+        # `_wants_native_ollama`.
         self.num_ctx = num_ctx
 
     def model_id(self) -> str:
@@ -459,6 +503,26 @@ class Backend:
 
     # ------------------------------------------------------------------ calls
 
+    def _wants_native_ollama(self) -> bool:
+        """Whether `chat()` sends through Ollama's native `POST /api/chat` instead of the
+        OpenAI-shaped `/v1/chat/completions`.
+
+        Only matters when `num_ctx` was actually asked for -- see the note on `self.num_ctx` in
+        `__init__` for why the OpenAI path cannot carry it. `H3IR_LLM_API` picks the wire shape
+        explicitly (`"ollama"` or `"openai"`); left at the default `"auto"` it is detected once
+        per `Backend` instance by `_is_ollama_endpoint` (`{root}/api/version`, a path only Ollama
+        answers; see `liveness_urls`) -- so a non-Ollama OpenAI-compatible endpoint (vLLM, llama.cpp, a hosted
+        API) keeps getting exactly the request it got before this existed.
+        """
+        if self.num_ctx <= 0:
+            return False
+        mode = (self.cfg.api_mode or "auto").strip().lower()
+        if mode == "ollama":
+            return True
+        if mode == "openai":
+            return False
+        return self._is_ollama_endpoint()
+
     def chat(self, messages: list[dict[str, Any]], *, thinking: bool | None = None,
              max_tokens: int | None = None, temperature: float = 0.7,
              seed: int | None = None, response_format: dict[str, Any] | None = None,
@@ -518,21 +582,59 @@ class Backend:
                 raise last
             raise BackendError("the in-process model was asked nothing; this is a bug")
 
+        native = self._wants_native_ollama()
+        budget = max_tokens or self.cfg.max_tokens
+        build = self._native_body if native else self._openai_body
+        body = build(messages, thinking=thinking, budget=budget, temperature=temperature,
+                     seed=seed, response_format=response_format, stop=stop)
+
+        last: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return self._once_native(body) if native else self._once(body)
+            except (TruncatedResponse, httpx.HTTPError) as e:
+                last = e
+                if attempt < retries:
+                    # Growing the budget is right when reasoning ate it, and wrong when the
+                    # model is looping -- there, each retry multiplies the wasted time. So the
+                    # ladder is capped rather than open-ended.
+                    if isinstance(e, TruncatedResponse):
+                        grown = int(budget * 1.75)
+                        ceiling = max(self.cfg.max_tokens, 2 * MAX_GROWTH_BASE)
+                        if grown > ceiling:
+                            log.warning("truncated at %s tokens and the ceiling is %s; not "
+                                        "growing further", budget, ceiling)
+                            break
+                        budget = grown
+                        if native:
+                            body["options"]["num_predict"] = budget
+                        else:
+                            body["max_tokens"] = budget
+                        log.warning("truncated; retrying with max_tokens=%s", budget)
+                    else:
+                        time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+        # Re-raise the original so callers can still see WHY it failed. TruncatedResponse is a
+        # BackendError, so `except BackendError` in the compiler still catches it and falls back.
+        if isinstance(last, BackendError):
+            raise last
+        raise BackendError(f"chat failed after {retries + 1} attempt(s): {last}") from last
+
+    def _openai_body(self, messages: list[dict[str, Any]], *, thinking: bool, budget: int,
+                     temperature: float, seed: int | None,
+                     response_format: dict[str, Any] | None,
+                     stop: list[str] | None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.model_id(),
             "messages": messages,
-            "max_tokens": max_tokens or self.cfg.max_tokens,
+            "max_tokens": budget,
             "temperature": temperature,
         }
         if seed is not None:
             body["seed"] = seed
         if stop:
             body["stop"] = stop
-        if self.num_ctx > 0:
-            # The only spelling Ollama honours for this. Omitted entirely rather than sent as 0
-            # or null: a caller that never asked for a larger window gets exactly the request
-            # every existing caller already sends.
-            body["options"] = {"num_ctx": self.num_ctx}
         if response_format is not None:
             body["response_format"] = response_format
         if not thinking:
@@ -548,35 +650,38 @@ class Backend:
                 # hosted API keep the exact request they already received -- `reasoning_effort` is
                 # a live field for hosted reasoning models, and "none" is not one of their values.
                 body["reasoning_effort"] = "none"
+        return body
 
-        last: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                return self._once(body)
-            except (TruncatedResponse, httpx.HTTPError) as e:
-                last = e
-                if attempt < retries:
-                    # Growing the budget is right when reasoning ate it, and wrong when the
-                    # model is looping -- there, each retry multiplies the wasted time. So the
-                    # ladder is capped rather than open-ended.
-                    if isinstance(e, TruncatedResponse):
-                        grown = int(body["max_tokens"] * 1.75)
-                        ceiling = max(self.cfg.max_tokens, 2 * MAX_GROWTH_BASE)
-                        if grown > ceiling:
-                            log.warning("truncated at %s tokens and the ceiling is %s; not "
-                                        "growing further", body["max_tokens"], ceiling)
-                            break
-                        body["max_tokens"] = grown
-                        log.warning("truncated; retrying with max_tokens=%s", body["max_tokens"])
-                    else:
-                        time.sleep(1.5 * (attempt + 1))
-                    continue
-                break
-        # Re-raise the original so callers can still see WHY it failed. TruncatedResponse is a
-        # BackendError, so `except BackendError` in the compiler still catches it and falls back.
-        if isinstance(last, BackendError):
-            raise last
-        raise BackendError(f"chat failed after {retries + 1} attempt(s): {last}") from last
+    def _native_body(self, messages: list[dict[str, Any]], *, thinking: bool, budget: int,
+                      temperature: float, seed: int | None,
+                      response_format: dict[str, Any] | None,
+                      stop: list[str] | None) -> dict[str, Any]:
+        """Ollama's native `/api/chat` shape -- the one wire path `num_ctx > 0` actually reaches.
+        See `self.num_ctx` in `__init__` and `_wants_native_ollama`."""
+        options: dict[str, Any] = {
+            "num_ctx": self.num_ctx,
+            "num_predict": budget,
+            "temperature": temperature,
+        }
+        if seed is not None:
+            options["seed"] = seed
+        if stop:
+            options["stop"] = stop
+        body: dict[str, Any] = {
+            "model": self.model_id(),
+            "messages": _to_native_messages(messages),
+            "stream": False,
+            "options": options,
+            # Native `think` is the direct equivalent of the OpenAI path's
+            # `chat_template_kwargs.enable_thinking` -- both gate F15/F16 below.
+            "think": bool(thinking),
+        }
+        if response_format is not None:
+            # Native `format` takes the raw JSON schema, not the OpenAI `{"type": "json_schema",
+            # "json_schema": {...}}` envelope `json_call` builds.
+            body["format"] = (response_format.get("json_schema") or {}).get(
+                "schema", response_format)
+        return body
 
     def _once(self, body: dict[str, Any]) -> Reply:
         t0 = time.time()
@@ -587,6 +692,49 @@ class Backend:
             raise EndpointRefused(r.status_code, r.text)
         data = r.json()
         return _reply_from_completion(data, wall, body["max_tokens"])
+
+    def _once_native(self, body: dict[str, Any]) -> Reply:
+        """The `/api/chat` twin of `_once`, same failure handling (F15/F17), mapped onto the
+        native response shape: `message.content`/`message.thinking` instead of
+        `choices[0].message`, `done_reason` instead of `finish_reason`, `prompt_eval_count`/
+        `eval_count` instead of `usage.*`."""
+        t0 = time.time()
+        r = self._http().post(f"{self._root_url()}/api/chat", json=body, headers=self._headers())
+        wall = time.time() - t0
+        if r.status_code >= 400:
+            raise EndpointRefused(r.status_code, r.text)
+        data = r.json()
+        msg = data.get("message") or {}
+        content = msg.get("content")
+        reasoning = msg.get("thinking") or ""
+        completion_tokens = data.get("eval_count", 0)
+        finish = data.get("done_reason") or ("stop" if data.get("done") else "?")
+
+        # F15, same evidence-based message as `_once`.
+        if content is None or not str(content).strip():
+            why = ("the reasoning budget was consumed before any answer was emitted" if reasoning
+                   else "no reasoning came back either, so the budget is not the explanation and "
+                        "this model stopped without answering")
+            raise TruncatedResponse(
+                f"model returned no content (finish_reason={finish}, "
+                f"completion_tokens={completion_tokens}, "
+                f"reasoning_chars={len(reasoning)}): {why}")
+        if finish == "length":
+            raise TruncatedResponse(
+                f"response hit num_predict ({body['options'].get('num_predict')}); "
+                "output is incomplete")
+
+        # F17, same vLLM #35221 guard.
+        text = str(content)
+        if "<think>" in text and "</think>" not in text:
+            raise TruncatedResponse(
+                "content carries an unclosed <think> — this is leaked in-progress reasoning, "
+                "not an answer (vLLM #35221)")
+
+        return Reply(content=str(content).strip(), reasoning=reasoning,
+                     prompt_tokens=data.get("prompt_eval_count", 0),
+                     completion_tokens=completion_tokens,
+                     finish_reason=finish, wall_s=wall, model=data.get("model", ""))
 
     # ------------------------------------------------------------------ structured
 
